@@ -24,6 +24,7 @@ from pagerctl import Pager
 
 PAYLOAD_DIR = os.path.dirname(os.path.abspath(__file__))
 PROFILES_FILE = os.path.join(PAYLOAD_DIR, "profiles.json")
+BACKGROUND_IMAGE = os.path.join(PAYLOAD_DIR, "background.png")
 
 # WiFi Pineapple Pager Client Mode Architecture:
 # - GUI uses ONLY wireless.wlan0cli (single STA profile)
@@ -31,16 +32,18 @@ PROFILES_FILE = os.path.join(PAYLOAD_DIR, "profiles.json")
 # - We NEVER create new STA interfaces - only modify wlan0cli
 # - This keeps full compatibility with Pineapple GUI
 UCI_INTERFACE = "wlan0cli"      # UCI config section name
-RUNTIME_INTERFACE = "phy0-sta0"  # Runtime interface for status check
+RUNTIME_INTERFACE = "wlan0cli"  # Runtime interface for status check (same as UCI on Pager)
 NETWORK_INTERFACE = "cli"        # Network interface name
 
-# Colors
-COLOR_BG = 0x0821           # Dark blue background
-COLOR_HEADER_BG = 0x2104    # Darker header
-COLOR_MENU_BG = 0x1082      # Menu item background
-COLOR_MENU_SEL = 0x03E0     # Selected item (green)
+# Colors - Cyberpunk neon theme
+COLOR_BG = 0x0821           # Dark blue background (fallback)
+COLOR_HEADER_BG = 0x0000    # Black header overlay
+COLOR_MENU_BG = 0x0000      # Transparent (not used - no background for menu items)
+COLOR_MENU_SEL = 0xF81F     # Neon magenta/pink for selected item (RGB 255,0,255)
+COLOR_NEON_CYAN = 0x07FF    # Neon cyan
+COLOR_NEON_PINK = 0xF81F    # Neon pink/magenta
 COLOR_TEXT = 0xFFFF         # White text
-COLOR_TEXT_DIM = 0x8410     # Gray text
+COLOR_TEXT_DIM = 0xC618     # Lighter gray text (more visible)
 COLOR_CONNECTED = 0x07E0    # Green for connected
 COLOR_DISCONNECTED = 0xF800 # Red for disconnected
 COLOR_ACCENT = 0x07FF       # Cyan accent
@@ -69,36 +72,45 @@ KEYBOARD_UPPER = [
 
 def get_current_wifi_status():
     """
-    Get REAL runtime WiFi connection status.
-    Uses 'iw dev' to check actual connection, not UCI config.
-    This shows what network we're ACTUALLY connected to.
+    Pineapple Pager runtime connection detection.
+    Tries multiple interfaces because runtime STA name may vary.
+    Primary is wlan0cli (the real STA interface on Pager).
     """
-    try:
-        # Check runtime connection using iw (not iwinfo which may show config)
-        result = subprocess.run(
-            ["iw", "dev", RUNTIME_INTERFACE, "link"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
+    # Try interfaces in order of likelihood on Pager
+    interfaces = ["wlan0cli", "phy0-sta0", "wlan0"]
 
-        if result.returncode != 0 or "Not connected" in result.stdout:
-            return None, None
+    for iface in interfaces:
+        try:
+            result = subprocess.run(
+                ["iw", "dev", iface, "link"],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
 
-        output = result.stdout
-        ssid = None
-        signal = None
+            if result.returncode != 0:
+                continue
 
-        for line in output.split('\n'):
-            line = line.strip()
-            if line.startswith('SSID:'):
-                ssid = line.split(':', 1)[1].strip()
-            elif line.startswith('signal:'):
-                signal = line.split(':', 1)[1].strip()
+            if "Not connected" in result.stdout:
+                continue
 
-        return ssid, signal
-    except Exception:
-        return None, None
+            ssid = None
+            signal = None
+
+            for line in result.stdout.split('\n'):
+                line = line.strip()
+                if line.startswith('SSID:'):
+                    ssid = line.split(':', 1)[1].strip()
+                elif line.startswith('signal:'):
+                    signal = line.split(':', 1)[1].strip()
+
+            if ssid:
+                return ssid, signal
+
+        except Exception:
+            pass
+
+    return None, None
 
 
 def get_gui_config_ssid():
@@ -346,18 +358,35 @@ class WiFManUI:
         self.p = pager
         self.width = pager.width
         self.height = pager.height
+        # Load background image (dimmed cyberpunk banner)
+        self.bg_image = None
+        if os.path.exists(BACKGROUND_IMAGE):
+            self.bg_image = pager.load_image(BACKGROUND_IMAGE)
+
+    def cleanup(self):
+        """Free resources."""
+        if self.bg_image:
+            self.p.free_image(self.bg_image)
+            self.bg_image = None
+
+    def draw_background(self):
+        """Draw background image or fallback to solid color."""
+        if self.bg_image:
+            self.p.draw_image(0, 0, self.bg_image)
+        else:
+            self.p.clear(COLOR_BG)
 
     def draw_header(self, title, connected_ssid=None, signal=None):
         """Draw the header with REAL connection status (runtime, not config)."""
-        # Header background
-        self.p.fill_rect(0, 0, self.width, 40, COLOR_HEADER_BG)
+        # Semi-transparent header (dark overlay on background)
+        self.p.fill_rect(0, 0, self.width, 40, Pager.rgb(0, 0, 0))
 
         # Title
         self.p.draw_text_centered(5, title, COLOR_TEXT, 2)
 
         # Connection status bar - shows REAL connected network
         if connected_ssid:
-            status_text = f"{connected_ssid}"
+            status_text = f"Connected: {connected_ssid}"
             if signal:
                 status_text += f" {signal}"
             self.p.draw_text_centered(28, status_text, COLOR_CONNECTED, 1)
@@ -370,7 +399,7 @@ class WiFManUI:
                 else:
                     self.p.draw_text_centered(28, "Client Mode ON (no network)", COLOR_ACCENT, 1)
             else:
-                self.p.draw_text_centered(28, "Client Mode OFF", COLOR_DISCONNECTED, 1)
+                self.p.draw_text_centered(28, "Not connected", COLOR_DISCONNECTED, 1)
 
         # Separator line
         self.p.hline(0, 40, self.width, COLOR_ACCENT)
@@ -378,14 +407,15 @@ class WiFManUI:
     def draw_legend(self):
         """Draw the control legend at the bottom."""
         y = self.height - 18
-        self.p.fill_rect(0, y - 2, self.width, 20, COLOR_HEADER_BG)
-        self.p.hline(0, y - 2, self.width, COLOR_ACCENT)
+        # Semi-transparent dark bar
+        self.p.fill_rect(0, y - 4, self.width, 22, Pager.rgb(0, 0, 0))
+        self.p.hline(0, y - 4, self.width, COLOR_NEON_CYAN)
 
         legend = "UP/DOWN=Move  GREEN=Select  RED=Back"
-        self.p.draw_text_centered(y, legend, COLOR_TEXT_DIM, 1)
+        self.p.draw_text_centered(y, legend, COLOR_NEON_CYAN, 1)
 
-    def draw_menu(self, items, selected_index, start_y=45, item_height=28):
-        """Draw a menu with selectable items."""
+    def draw_menu(self, items, selected_index, start_y=45, item_height=32, font_size=2):
+        """Draw a menu with selectable items - transparent bg, neon selection."""
         visible_items = (self.height - start_y - 25) // item_height
 
         # Calculate scroll offset
@@ -403,12 +433,13 @@ class WiFManUI:
 
             y = start_y + display_idx * item_height
 
-            # Background for selected item
+            # Only draw background for selected item (neon highlight)
             if i == selected_index:
-                self.p.fill_rect(5, y, self.width - 10, item_height - 2, COLOR_MENU_SEL)
-                text_color = COLOR_BG
+                # Neon glow effect - draw slightly larger rect first
+                self.p.fill_rect(3, y - 1, self.width - 6, item_height, COLOR_MENU_SEL)
+                text_color = Pager.BLACK  # Dark text on neon bg
             else:
-                self.p.fill_rect(5, y, self.width - 10, item_height - 2, COLOR_MENU_BG)
+                # No background for unselected - transparent over cyberpunk bg
                 text_color = COLOR_TEXT
 
             # Item text
@@ -420,19 +451,19 @@ class WiFManUI:
             else:
                 text = str(item)
 
-            # Center text vertically in item
-            text_y = y + (item_height - 10) // 2
-            self.p.draw_text(15, text_y, text, text_color, 1)
+            # Center text vertically in item (adjusted for font size 2)
+            text_y = y + (item_height - 14) // 2
+            self.p.draw_text(15, text_y, text, text_color, font_size)
 
         # Scroll indicators
         if scroll_offset > 0:
-            self.p.draw_text(self.width - 20, start_y, "^", COLOR_ACCENT, 1)
+            self.p.draw_text(self.width - 20, start_y, "^", COLOR_NEON_CYAN, 2)
         if scroll_offset + visible_items < len(items):
-            self.p.draw_text(self.width - 20, start_y + (visible_items - 1) * item_height, "v", COLOR_ACCENT, 1)
+            self.p.draw_text(self.width - 20, start_y + (visible_items - 1) * item_height, "v", COLOR_NEON_CYAN, 2)
 
     def draw_keyboard(self, title, text, keyboard, row, col, is_upper=False):
         """Draw full on-screen keyboard grid."""
-        self.p.clear(COLOR_BG)
+        self.draw_background()
 
         # Title
         self.p.draw_text_centered(2, title, COLOR_ACCENT, 1)
@@ -545,7 +576,7 @@ class WiFManUI:
 
     def show_message(self, title, message, wait=True):
         """Show a message and optionally wait for button press."""
-        self.p.clear(COLOR_BG)
+        self.draw_background()
         self.draw_header(title)
 
         # Message
@@ -672,7 +703,7 @@ def select_security(ui, pager, current_security="wpa2"):
             break
 
     while True:
-        pager.clear(COLOR_BG)
+        ui.draw_background()
         ui.draw_header("Security Type")
         ui.draw_menu([item["text"] for item in items], selected)
         ui.draw_legend()
@@ -750,7 +781,7 @@ def scan_screen(ui, pager, data):
             security = n.get('security', 'wpa2').upper()
             items.append(f"{n['ssid']} [{security}] {signal}")
 
-        pager.clear(COLOR_BG)
+        ui.draw_background()
         ui.draw_header(f"Found {len(networks)} Networks")
         ui.draw_menu(items, selected)
         ui.draw_legend()
@@ -823,6 +854,9 @@ def scan_screen(ui, pager, data):
 def profiles_screen(ui, pager, data):
     """Screen for managing WiFi profiles."""
     while True:
+        # Reload profiles from file each time (in case of external changes)
+        data.clear()
+        data.update(load_profiles())
         profiles = data.get("profiles", [])
 
         # Build menu items
@@ -838,7 +872,7 @@ def profiles_screen(ui, pager, data):
         while True:
             ssid, signal = get_current_wifi_status()
 
-            pager.clear(COLOR_BG)
+            ui.draw_background()
             ui.draw_header("WiFi Profiles", ssid, signal)
 
             if items:
@@ -921,7 +955,7 @@ def profile_action_menu(ui, pager, profile):
     selected = 0
 
     while True:
-        pager.clear(COLOR_BG)
+        ui.draw_background()
         ui.draw_header(profile["ssid"])
         ui.draw_menu(items, selected)
         ui.draw_legend()
@@ -945,7 +979,7 @@ def profile_action_menu(ui, pager, profile):
                 return "edit"
             elif items[selected] == "Delete":
                 # Confirm deletion
-                pager.clear(COLOR_BG)
+                ui.draw_background()
                 ui.draw_dialog("Confirm Delete", f"Delete {profile['ssid']}?", ["GREEN=Yes", "RED=No"])
                 pager.flip()
 
@@ -1014,7 +1048,7 @@ def main_menu(ui, pager, data):
             {"text": "4. Exit", "disabled": False},
         ]
 
-        pager.clear(COLOR_BG)
+        ui.draw_background()
         ui.draw_header("WiFMan", ssid, signal)
         ui.draw_menu([item["text"] for item in items], selected, item_height=32)
         ui.draw_legend()
@@ -1114,6 +1148,7 @@ def main():
     cleanup and prevent GUI reset issues.
     """
     pager = None
+    ui = None
 
     try:
         # Initialize Pager explicitly (not via context manager)
@@ -1133,7 +1168,7 @@ def main():
             save_profiles(data)
 
         # Show splash screen
-        pager.clear(COLOR_BG)
+        ui.draw_background()
         pager.draw_text_centered(60, "WiFMan by LAB5", Pager.CYAN, 3)
         pager.draw_text_centered(110, "WiFi Network Manager", Pager.WHITE, 1)
         pager.draw_text_centered(140, "v1.0", Pager.GRAY, 1)
@@ -1164,6 +1199,9 @@ def main():
         traceback.print_exc()
 
     finally:
+        # Clean up UI resources (background image)
+        if ui:
+            ui.cleanup()
         # Explicit cleanup (like pagergotchi) - critical for proper FB release
         if pager:
             pager.cleanup()

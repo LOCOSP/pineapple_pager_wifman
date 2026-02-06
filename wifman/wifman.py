@@ -809,7 +809,7 @@ def scan_screen(ui, pager, data):
                 else:
                     data["last_connected"] = profile["ssid"]
                     save_profiles(data)
-                    ui.show_message("Info", f"Config saved for {network['ssid']}\nConnection pending...")
+                    ui.show_message("Info", f"Config saved for {network['ssid']}\nConnection established. ")
             else:
                 ui.show_message("Error", "Failed to set config")
 
